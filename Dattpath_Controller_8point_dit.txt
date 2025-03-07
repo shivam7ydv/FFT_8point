@@ -1,0 +1,239 @@
+module dft_datapath (
+    input clk, reset,
+    input signed [7:0] in0, in1, in2, in3, in4, in5, in6, in7,
+    input [3:0] stage_sel, // Stage select signal from controller
+    output reg signed [15:0] out0, out4,
+    output reg signed [7:0] out1_real, out1_imag, out2_real, out2_imag, out3_real, out3_imag,
+                      out5_real, out5_imag, out6_real, out6_imag, out7_real, out7_imag
+);
+
+    // Intermediate signals for computations
+    reg signed [8:0] x0, x1, x2, x3, x4, x5, x6, x7;
+    wire signed [16:0] y0, y1_real, y1_imag, y2, y3_real, y3_imag, y4, y5_real, y5_imag, y6, y7_real, y7_imag;
+    wire signed [25:0] w81_r, w81_i, w83_r, w83_i;
+
+    // Twiddle factors for scaling (scaled by 2^7)
+    parameter signed [7:0] W81_real = 8'd90;    // +90
+    parameter signed [7:0] W81_imag = -8'd90;   // -90
+    parameter signed [7:0] W83_real = -8'd90;   // -90
+    parameter signed [7:0] W83_imag = -8'd90;   // -90
+
+    // Stage 1: Compute the intermediate sums and differences
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            // Reset all registers
+            {x0, x1, x2, x3, x4, x5, x6, x7} <= 0;
+        end else if (stage_sel == 4'd0) begin
+            // Compute initial values for Stage 1 (4-point DFTs on even and odd indices)
+            x0 <= in0 + in4;
+            x1 <= in0 - in4;
+            x2 <= in2 + in6;
+            x3 <= in2 - in6;
+            x4 <= in1 + in5;
+            x5 <= in1 - in5;
+            x6 <= in3 + in7;
+            x7 <= in3 - in7;
+        end
+    end
+
+    // Stage 2: Combine results from Stage 1
+    assign y0 = x0 + x2;
+    assign y1_real = x1;
+    assign y1_imag = -x3;
+    assign y2 = x0 - x2;
+    assign y3_real = x1;
+    assign y3_imag = x3;
+
+    assign y4 = x4 + x6;
+    assign y5_real = x5;
+    assign y5_imag = -x7;
+    assign y6 = x4 - x6;
+    assign y7_real = x5;
+    assign y7_imag = x7;
+
+    // Multiplication with Twiddle Factors (Stage 3)
+    //Booth multiplier module
+    wire signed [24:0]A,B,C,D,E,F,G,H;
+    booth mult1(A,y5_real,W81_real,clk);
+    booth mult2(B,y5_imag,W81_imag,clk);
+    booth mult3(C,y5_real,W81_imag,clk);
+    booth mult4(D,y5_imag,W81_real,clk);
+    
+    booth mult5(E,y7_real,W83_real,clk);
+    booth mult6(F,y7_imag,W83_imag,clk);
+    booth mult7(G,y7_real,W83_imag,clk);
+    booth mult8(H,y7_imag,W83_real,clk);
+    
+    
+    /*assign w81_r = (y5_real * W81_real) - (y5_imag * W81_imag);
+    assign w81_i = (y5_real * W81_imag) + (y5_imag * W81_real);
+
+    assign w83_r = (y7_real * W83_real) - (y7_imag * W83_imag);
+    assign w83_i = (y7_real * W83_imag) + (y7_imag * W83_real);*/
+    
+    assign w81_r = (A) - (B);
+    assign w81_i = (C) + (D);
+
+    assign w83_r = (E) - (F);
+    assign w83_i = (G) + (H);
+
+    // Output assignment based on stage control
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            // Reset all outputs
+            {out0, out4, out1_real, out1_imag, out2_real, out2_imag, out3_real, out3_imag,
+             out5_real, out5_imag, out6_real, out6_imag, out7_real, out7_imag} <= 0;
+        end else begin
+            case (stage_sel)
+                4'd1: begin
+                    out0 <= y0 + y4;
+                    out4 <= y0 - y4;
+                end
+                4'd2: begin
+                    out1_real <= (w81_r >>> 7) + y1_real;
+                    out1_imag <= (w81_i >>> 7) + y1_imag;
+                    out2_real <= y2;
+                    out2_imag <= -y6 ;
+                end
+                4'd3: begin
+                    out3_real <= (w83_r >>> 7) + y3_real;
+                    out3_imag <= (w83_i >>> 7) + y3_imag;
+                end
+                4'd4: begin
+                    out5_real <= y1_real - (w81_r >>> 7);
+                    out5_imag <= y1_imag - (w81_i >>> 7);
+                end
+                4'd5: begin
+                    out6_real <= y2;
+                    out6_imag <= y6;
+                end
+                4'd6: begin
+                    out7_real <= y3_real - (w83_r >>> 7);
+                    out7_imag <= y3_imag - (w83_i >>> 7);
+                end
+            endcase
+        end
+    end
+endmodule
+
+module dft_controller (
+    input clk, reset,
+    output reg [3:0] stage_sel // Stage select signal for datapath
+);
+
+    // State encoding
+    reg [3:0] state, next_state;
+    parameter IDLE = 4'd0, STAGE1 = 4'd1, STAGE2 = 4'd2, STAGE3 = 4'd3, STAGE4 = 4'd4, STAGE5 = 4'd5, DONE = 4'd6;
+
+    // State transition logic
+    always @(posedge clk or posedge reset) begin
+        if (reset)
+            state <= IDLE;
+        else
+            state <= next_state;
+    end
+
+    // Next state logic and stage select output
+    always @(*) begin
+        case (state)
+            IDLE:     next_state = STAGE1;
+            STAGE1:   next_state = STAGE2;
+            STAGE2:   next_state = STAGE3;
+            STAGE3:   next_state = STAGE4;
+            STAGE4:   next_state = STAGE5;
+            STAGE5:   next_state = DONE;
+            DONE:     next_state = IDLE;
+            default:  next_state = IDLE;
+        endcase
+    end
+
+    // Output control signals based on state
+    always @(posedge clk or posedge reset) begin
+        if (reset)
+            stage_sel <= 4'd0;
+        else
+            stage_sel <= state;
+    end
+endmodule
+
+module dft_8_with_control (
+    input clk, reset,
+    input signed [7:0] in0, in1, in2, in3, in4, in5, in6, in7,
+    output signed [15:0] out0, out4,
+    output signed [7:0] out1_real, out1_imag, out2_real, out2_imag, out3_real, out3_imag,
+                        out5_real, out5_imag, out6_real, out6_imag, out7_real, out7_imag
+);
+
+    // Stage select signal from the controller
+    wire [3:0] stage_sel;
+
+    // Instantiate datapath and controller
+    dft_datapath datapath_inst (
+        .clk(clk), .reset(reset),
+        .in0(in0), .in1(in1), .in2(in2), .in3(in3),
+        .in4(in4), .in5(in5), .in6(in6), .in7(in7),
+        .stage_sel(stage_sel),
+        .out0(out0), .out4(out4),
+        .out1_real(out1_real), .out1_imag(out1_imag), .out2_real(out2_real), .out2_imag(out2_imag),
+        .out3_real(out3_real), .out3_imag(out3_imag), .out5_real(out5_real), .out5_imag(out5_imag),
+        .out6_real(out6_real), .out6_imag(out6_imag), .out7_real(out7_real), .out7_imag(out7_imag)
+    );
+
+    dft_controller controller_inst (
+        .clk(clk), .reset(reset),
+        .stage_sel(stage_sel)
+    );
+
+endmodule
+[10:29 AM, 11/13/2024] Raj Kushwaha: module tb_dft_8_with_control;
+
+    reg clk;
+    reg reset;
+    reg signed [7:0] in0, in1, in2, in3, in4, in5, in6, in7;
+    wire signed [15:0] out0, out4;
+    wire signed [7:0] out1_real, out1_imag, out2_real, out2_imag;
+    wire signed [7:0] out3_real, out3_imag, out5_real, out5_imag;
+    wire signed [7:0] out6_real, out6_imag, out7_real, out7_imag;
+
+    // Instantiate the DFT module
+    dft_8_with_control uut (
+        .clk(clk),
+        .reset(reset),
+        .in0(in0), .in1(in1), .in2(in2), .in3(in3),
+        .in4(in4), .in5(in5), .in6(in6), .in7(in7),
+        .out0(out0), .out4(out4),
+        .out1_real(out1_real), .out1_imag(out1_imag),
+        .out2_real(out2_real), .out2_imag(out2_imag),
+        .out3_real(out3_real), .out3_imag(out3_imag),
+        .out5_real(out5_real), .out5_imag(out5_imag),
+        .out6_real(out6_real), .out6_imag(out6_imag),
+        .out7_real(out7_real), .out7_imag(out7_imag)
+    );
+
+    // Clock generation
+    initial begin
+        clk = 0;
+        forever #5 clk = ~clk; // 10ns clock period
+    end
+
+    // Test sequence
+    initial begin
+        // Initialize inputs
+        reset = 1;
+        in0 = 8'd0; in1 = 8'd1; in2 = 8'd2; in3 = 8'd3;
+        in4 = 8'd4; in5 = 8'd5; in6 = 8'd6; in7 = 8'd7;
+        
+        #10 reset = 0;  
+        
+        // Monitor output
+      
+            $monitor($time, " out0=%d, out1_real=%d, out1_imag=%d, out2_real=%d, out2_imag=%d, out3_real=%d, out3_imag=%d, out4=%d, out5_real=%d, out5_imag=%d, out6_real=%d, out6_imag=%d, out7_real=%d, out7_imag=%d", 
+                out0, out1_real, out1_imag, out2_real, out2_imag, out3_real, out3_imag,
+                out4, out5_real, out5_imag, out6_real, out6_imag, out7_real, out7_imag);
+
+        
+        #200;
+        
+        $finish;
+    end
+endmodule
